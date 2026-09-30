@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.ruff_cache/
+
+# local runtime state / secrets - never commit
+pyvulcan.ini
+pyvulcan.ini.bak-*
+*_cookies.json
+*.sqlite
+*.har
+captures/

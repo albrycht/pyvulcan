@@ -1,0 +1,69 @@
+[global]
+
+; Decide which messages should be sent.
+; Possible values:
+;   - unsent - messages that were not previously sent
+;   - unread - messages that are unread in eduVULCAN
+# send_message=unread
+
+; If attachments should be forwarded with the message content
+; Possible values: true, false
+# fetch_attachments=true
+
+; Name of sqlite DB file that will be used by pyvulcan.
+; File will be created if absent.
+; Can be configured globally or per child
+# db_name=pyvulcan.sqlite
+
+; How old messages should still be forwarded.
+; Value 4 means that only messages younger than 4 days will be forwarded.
+# max_age_of_sending_msg_days=4
+
+; Should debug messages be enabled.
+; Possible values: true, false
+# debug=false
+
+; How long (seconds) to sleep between users
+# sleep_between_users=10
+
+; This is example configuration for forwarding messages to email
+[user:ChildName]
+; eduvulcan.pl login (e-mail) and password
+vulcan_user=
+vulcan_pass=
+; optional - substring of mailbox name (usually child's first name or surname),
+; needed when one eduVULCAN login has access to more than one child.
+; Several [user:X] sections may share the same vulcan_user.
+;student=
+; optional, if not set global db_name is used
+;db_name=
+smtp_user=
+smtp_pass=
+smtp_server=
+smtp_port=587
+; email_dest is comma separated list of emails that will receive messages
+email_dest=
+
+; This is example configuration for forwarding messages to webhook
+#[user:ChildName2]
+#vulcan_user=
+#vulcan_pass=
+#student=
+#webhook=
+#webhook_attachments_source=vulcan_link
+
+; This is example configuration for forwarding messages to webhook with working attachments links via s3 bucket
+; Links from s3 bucket will work for 7 days
+; Please setup your bucket to auto-delete files after 7 days
+#[user:ChildName3]
+#vulcan_user=
+#vulcan_pass=
+#webhook=
+#webhook_attachments_source=s3://my-school-bucket/pyvulcan-attachments
+#s3_region=eu-central-1
+#s3_access_key_id=AKIAEXAMPLE
+#s3_secret_access_key=your-secret-key
+; Optional for temporary AWS credentials:
+#s3_session_token=
+; Optional for S3-compatible storage:
+#s3_endpoint_url=

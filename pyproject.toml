@@ -1,0 +1,26 @@
+[project]
+name = "pyvulcan"
+version = "0.1.0"
+description = "Forwards new messages from eduVULCAN (Vulcan UONET+) e-register to e-mail or webhook (Slack)."
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "beautifulsoup4>=4.12.3",
+    "boto3>=1.37.38",
+    "requests>=2.32.3",
+    "sqlalchemy>=2.0.36",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.4",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "S", "UP", "C4", "COM", "ISC", "Q"]
+ignore = ["COM812", "COM819", "E501", "ISC001", "ISC002", "Q000", "Q001", "Q002", "Q003", "S101"]
