@@ -15,13 +15,17 @@
 ; Can be configured globally or per child
 # db_name=pyvulcan.sqlite
 
-; How old messages should still be forwarded.
+; How old messages (and grades - by grade date) should still be forwarded.
 ; Value 4 means that only messages younger than 4 days will be forwarded.
 # max_age_of_sending_msg_days=4
 
 ; Should debug messages be enabled.
 ; Possible values: true, false
 # debug=false
+
+; What to check. Possible values: true, false
+# check_messages=true
+# check_grades=true
 
 ; How long (seconds) to sleep between users
 # sleep_between_users=10

@@ -69,6 +69,8 @@ class PyVulcanConfig:
     debug: bool = False
     sleep_between_users: int = 10
     cookie_file: str = "pyvulcan_cookies.json"
+    check_messages: bool = True
+    check_grades: bool = True
 
     def __post_init__(self):
         for field in dataclasses.fields(self):
@@ -87,6 +89,8 @@ class PyVulcanConfig:
             debug=global_config.getboolean("debug", None),
             sleep_between_users=global_config.getint("sleep_between_users", None),
             cookie_file=global_config.get("cookie_file", None),
+            check_messages=global_config.getboolean("check_messages", None),
+            check_grades=global_config.getboolean("check_grades", None),
             workdir=workdir,
         )
 
@@ -97,6 +101,8 @@ class PyVulcanConfig:
             fetch_attachments=str_to_bool(os.environ.get("FETCH_ATTACHMENTS")),
             max_age_of_sending_msg_days=str_to_int(os.environ.get("MAX_AGE_OF_SENDING_MSG_DAYS")),
             debug=str_to_bool(os.environ.get("VULCAN_DEBUG")),
+            check_messages=str_to_bool(os.environ.get("CHECK_MESSAGES")),
+            check_grades=str_to_bool(os.environ.get("CHECK_GRADES")),
             workdir=workdir,
         )
 
@@ -300,6 +306,25 @@ class Attachment(Base):
     s3_etag = Column(String, nullable=True)
 
 
+class Grade(Base):
+    __tablename__ = "grades"
+
+    # hash of (student, period, subject, column, value, date) - a changed grade gets a new key
+    key = Column(String, primary_key=True)
+    tenant = Column(String)
+    student = Column(String)
+    period = Column(String)  # "Okres 1", "Wyniki egzaminów", ...
+    subject = Column(String)
+    value = Column(String)  # "63", "94 (%)", "35/100", "5+", ...
+    date = Column(String)  # as returned by Vulcan, e.g. "27.09.2026"
+    category = Column(String)  # "Bieżące", "Sprawdzian", "Kartkówka", ...
+    description = Column(String)
+    weight = Column(String)
+    teacher = Column(String)
+    first_seen = Column(DateTime)
+    email_sent = Column(Boolean, default=False)
+
+
 def parse_s3_source(webhook_attachments_source: str) -> tuple[str | None, str]:
     if not webhook_attachments_source or not webhook_attachments_source.startswith("s3://"):
         return None, ""
@@ -399,14 +424,15 @@ def solve_pow_captcha(challenge: str, difficulty: int, rounds: int) -> str:
 
 
 class VulcanClient:
-    """Client for eduVULCAN web messages module (wiadomosci.eduvulcan.pl).
+    """Client for eduVULCAN web modules: messages (wiadomosci.eduvulcan.pl) and student panel (uczen.eduvulcan.pl).
 
     Flow:
       1. eduvulcan.pl/logowanie - login form (+ optional proof-of-work captcha)
-      2. eduvulcan.pl/api/ap - JSON with one JWT per student; `tenant` claim is the school symbol
-      3. wiadomosci.eduvulcan.pl/<tenant>/App - WS-Federation SSO via auto-submitted forms,
-         final page contains antiForgeryToken used as X-V-RequestVerificationToken header
-      4. wiadomosci.eduvulcan.pl/<tenant>/api/... - JSON API
+      2. eduvulcan.pl/api/ap - JSON with one JWT per student; claims: `name`, `tenant` (school symbol),
+         `uri` (entry point of the student panel)
+      3. <module>/<tenant>/App - WS-Federation SSO via auto-submitted forms, final page contains
+         antiForgeryToken used as X-V-RequestVerificationToken header
+      4. <module>/<tenant>/api/... - JSON API
 
     All cookies are persisted per login, so a run every few minutes keeps the session alive and a
     password login happens only after the server-side session expires.
@@ -414,6 +440,7 @@ class VulcanClient:
 
     EDUVULCAN_URL = "https://eduvulcan.pl"
     MESSAGES_URL = "https://wiadomosci.eduvulcan.pl"
+    STUDENT_URL = "https://uczen.eduvulcan.pl"
     MAX_SSO_HOPS = 8
 
     def __init__(self, login: str, passwd: str, pyvulcan_config: PyVulcanConfig):
@@ -423,8 +450,8 @@ class VulcanClient:
         self._session = requests.session()
         self._session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "pl"})
         self._state_path = Path(self._config.workdir) / self._config.cookie_file
-        self._tenants: list[str] = []
-        self._anti_forgery: dict[str, str] = {}  # tenant -> antiForgeryToken
+        self._students: list[dict] = []  # [{"name", "tenant", "uri"}] from /api/ap JWTs
+        self._anti_forgery: dict[tuple[str, str], str] = {}  # (module url, tenant) -> antiForgeryToken
         self._logged_in_this_run = False
         self.load_state()
 
@@ -441,7 +468,7 @@ class VulcanClient:
 
     def load_state(self) -> None:
         state = self._load_state_per_login().get(self._login) or {}
-        self._tenants = state.get("tenants", [])
+        self._students = state.get("students", [])
         for entry in state.get("cookies", []):
             cookie = requests.cookies.create_cookie(
                 name=entry["name"],
@@ -454,7 +481,7 @@ class VulcanClient:
     def store_state(self) -> None:
         state_per_login = self._load_state_per_login()
         state_per_login[self._login] = {
-            "tenants": self._tenants,
+            "students": self._students,
             "cookies": [
                 {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path} for c in self._session.cookies
             ],
@@ -467,6 +494,7 @@ class VulcanClient:
     def _password_login(self) -> None:
         logger.info(f"Logging in to eduVULCAN as {self._login}")
         self._session.cookies.clear()
+        self._anti_forgery.clear()
         self._session.post(f"{self.EDUVULCAN_URL}/Account/QueryUserInfo", data={"UserName": self._login})
         login_url = f"{self.EDUVULCAN_URL}/logowanie"
         soup = BeautifulSoup(self._session.get(login_url).text, "html.parser")
@@ -495,7 +523,7 @@ class VulcanClient:
         self._session.get(urljoin(login_url, resp.headers.get("Location", "/")))
         self._logged_in_this_run = True
 
-    def _discover_tenants(self) -> list[str]:
+    def _discover_students(self) -> list[dict]:
         resp = self._session.get(f"{self.EDUVULCAN_URL}/api/ap")
         ap_input = BeautifulSoup(resp.text, "html.parser").find("input", id="ap")
         if ap_input is None:
@@ -503,15 +531,22 @@ class VulcanClient:
         ap = json.loads(html.unescape(ap_input["value"]))
         if not ap.get("Success"):
             raise RuntimeError(f"eduvulcan.pl/api/ap failed: {ap.get('ErrorMessage')}")
-        tenants = []
+        students = []
         for token in ap.get("Tokens") or []:
             payload = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=="))
             logger.info(f"Found student {payload.get('name')} in {payload.get('tenant')}")
-            if payload.get("tenant") and payload["tenant"] not in tenants:
-                tenants.append(payload["tenant"])
-        if not tenants:
+            if payload.get("tenant"):
+                students.append(
+                    {"name": payload.get("name", ""), "tenant": payload["tenant"], "uri": payload.get("uri")}
+                )
+        if not students:
             raise RuntimeError("No students assigned to this eduVULCAN account")
-        return tenants
+        return students
+
+    def _relogin(self) -> None:
+        self._password_login()
+        self._students = self._discover_students()
+        self.store_state()
 
     def _follow_sso_forms(self, resp: requests.Response) -> requests.Response:
         """Submits WS-Federation "Working..." auto-post forms (wa/wresult/wctx) until the final page."""
@@ -523,31 +558,38 @@ class VulcanClient:
             resp = self._session.post(urljoin(resp.url, form["action"]), data=data)
         raise RuntimeError("Too many SSO redirects")
 
-    def _open_messages_app(self, tenant: str) -> bool:
-        resp = self._follow_sso_forms(self._session.get(f"{self.MESSAGES_URL}/{tenant}/App"))
+    def _try_open_app(self, module_url: str, tenant: str, entry_url: str) -> bool:
+        resp = self._follow_sso_forms(self._session.get(entry_url))
         match = re.search(r"antiForgeryToken\s*:\s*'([^']*)'", resp.text)
-        if not resp.url.startswith(self.MESSAGES_URL) or match is None:
-            logger.debug(f"Messages app not available, ended at {resp.url}")
+        if not resp.url.startswith(f"{module_url}/{tenant}/") or match is None:
+            logger.debug(f"{module_url} app not available, ended at {resp.url}")
             return False
-        self._anti_forgery[tenant] = match.group(1)
+        self._anti_forgery[(module_url, tenant)] = match.group(1)
         return True
 
+    def _open_app(self, module_url: str, tenant: str) -> None:
+        """Opens module app (SSO) once per run; logs in again with password if the session expired."""
+        if (module_url, tenant) in self._anti_forgery:
+            return
+        for attempt in range(2):
+            if module_url == self.STUDENT_URL:
+                # Student panel has no generic entry point - use `uri` from the student's JWT
+                entry_url = next(s["uri"] for s in self._students if s["tenant"] == tenant and s.get("uri"))
+            else:
+                entry_url = f"{module_url}/{tenant}/App"
+            if self._try_open_app(module_url, tenant, entry_url):
+                return
+            if attempt == 0 and not self._logged_in_this_run:
+                logger.info("Session expired, logging in again")
+                self._relogin()
+        raise RuntimeError(f"Could not open {module_url}/{tenant} right after login")
+
     def __enter__(self):
-        if not self._tenants:
+        if not self._students or not all(s.get("uri") for s in self._students):
             try:
-                self._tenants = self._discover_tenants()
+                self._students = self._discover_students()
             except SessionExpired:
-                self._password_login()
-                self._tenants = self._discover_tenants()
-        for tenant in self._tenants:
-            if self._open_messages_app(tenant):
-                continue
-            if self._logged_in_this_run:
-                raise RuntimeError(f"Could not open messages module for {tenant} right after login")
-            logger.info("Session expired, logging in again")
-            self._password_login()
-            self._tenants = self._discover_tenants()
-            return self.__enter__()
+                self._relogin()
         logger.info(f"Session ready for {self._login} (fresh login: {self._logged_in_this_run})")
         self.store_state()
         return self
@@ -556,36 +598,42 @@ class VulcanClient:
         # Cookies may be refreshed by the server on every call - always persist them
         self.store_state()
 
-    # --- messages API ------------------------------------------------------
-
     @property
     def tenants(self) -> list[str]:
-        return list(self._tenants)
+        return list(dict.fromkeys(s["tenant"] for s in self._students))
 
-    def _api_get(self, tenant: str, path: str, **params):
+    def _api_get(self, module_url: str, tenant: str, path: str, **params):
+        self._open_app(module_url, tenant)
         resp = self._session.get(
-            f"{self.MESSAGES_URL}/{tenant}/api/{path}",
+            f"{module_url}/{tenant}/api/{path}",
             params=params,
             headers={
                 "Accept": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
-                "X-V-RequestVerificationToken": self._anti_forgery.get(tenant, ""),
-                "Referer": f"{self.MESSAGES_URL}/{tenant}/App/odebrane",
+                "X-V-RequestVerificationToken": self._anti_forgery.get((module_url, tenant), ""),
+                "Referer": f"{module_url}/{tenant}/App",
             },
             allow_redirects=False,
         )
         if resp.status_code != 200:
             # 409 is returned when the session is gone
-            raise SessionExpired(f"GET api/{path} returned HTTP {resp.status_code}")
-        return resp.json()
+            raise SessionExpired(f"GET {module_url}/{tenant}/api/{path} returned HTTP {resp.status_code}")
+        data = resp.json()
+        if isinstance(data, dict) and data.get("success") is False and "feedback" in data:
+            # Errors come as HTTP 200 with {"success": false, "feedback": {"Message": ...}}
+            raise RuntimeError(f"api/{path} failed: {data['feedback'].get('Message')}")
+        return data
+
+    # --- messages API ------------------------------------------------------
 
     def mailboxes(self, tenant: str) -> list[dict]:
         """[{"globalKey": GUID, "nazwa": "Parent - R - Child - (unit)", "typUzytkownika": 2}]"""
-        return self._api_get(tenant, "Skrzynki")
+        return self._api_get(self.MESSAGES_URL, tenant, "Skrzynki")
 
     def received(self, tenant: str, mailbox_key: str, page_size: int = 50) -> list[dict]:
         """Newest first. Items: apiGlobalKey, id, data, temat, korespondenci, hasZalaczniki, przeczytana, ..."""
         return self._api_get(
+            self.MESSAGES_URL,
             tenant,
             "OdebraneSkrzynka",
             globalKeySkrzynka=mailbox_key,
@@ -595,7 +643,7 @@ class VulcanClient:
 
     def message_details(self, tenant: str, api_global_key: str) -> dict:
         """Does NOT mark the message as read. Keys: nadawca, odbiorcy, temat, tresc (HTML), data, zalaczniki."""
-        return self._api_get(tenant, "WiadomoscSzczegoly", apiGlobalKey=api_global_key)
+        return self._api_get(self.MESSAGES_URL, tenant, "WiadomoscSzczegoly", apiGlobalKey=api_global_key)
 
     def download_attachment(self, url: str) -> bytes:
         resp = self._session.get(url, headers={"Referer": f"{self.MESSAGES_URL}/"})
@@ -603,6 +651,41 @@ class VulcanClient:
         if "text/html" in resp.headers.get("content-type", ""):
             raise RuntimeError(f"Expected file, got HTML page from {resp.url}")
         return resp.content
+
+    # --- student panel API (grades) -----------------------------------------
+
+    def pupils(self, tenant: str) -> list[dict]:
+        """Children visible in student panel: [{"key", "uczen", "idDziennik", "oddzial", "globalKeySkrzynka", ...}]"""
+        return self._api_get(self.STUDENT_URL, tenant, "Context")["uczniowie"]
+
+    def periods(self, tenant: str, pupil: dict) -> list[dict]:
+        """[{"id", "numerOkresu", "dataOd", "dataDo"}]"""
+        return self._api_get(
+            self.STUDENT_URL,
+            tenant,
+            "OkresyKlasyfikacyjne",
+            key=pupil["key"],
+            idDziennik=pupil["idDziennik"],
+        )
+
+    def grades(self, tenant: str, pupil: dict, period_id: int) -> list[dict]:
+        """Per subject: przedmiotNazwa, kolumnyOcenyCzastkowe[{oceny[{wpis, dataOceny, kategoriaKolumny,
+        nazwaKolumny, waga, nauczyciel, ...}]}], srednia, proponowanaOcenaOkresowa, ocenaOkresowa, ..."""
+        return self._api_get(
+            self.STUDENT_URL,
+            tenant,
+            "Oceny",
+            key=pupil["key"],
+            idOkresKlasyfikacyjny=period_id,
+        )["ocenyPrzedmioty"]
+
+    def exams(self, tenant: str, pupil: dict) -> list[dict]:
+        """ "Wyniki egzaminów" tab"""
+        return self._api_get(self.STUDENT_URL, tenant, "Egzaminy", key=pupil["key"])
+
+    def external_exams(self, tenant: str, pupil: dict) -> list[dict]:
+        """ "Wyniki egzaminów zewnętrznych" tab"""
+        return self._api_get(self.STUDENT_URL, tenant, "EgzaminyZewnetrzne", key=pupil["key"])
 
 
 def parse_vulcan_date(s: str) -> datetime.datetime:
@@ -617,6 +700,74 @@ def html_to_text(contents_html: str) -> str:
     for p in soup.find_all(["p", "div", "li"]):
         p.insert_after("\n")
     return re.sub(r"\n{3,}", "\n\n", soup.get_text()).strip()
+
+
+EXAMS_PERIOD = "Wyniki egzaminów"
+EXTERNAL_EXAMS_PERIOD = "Wyniki egzaminów zewnętrznych"
+
+
+def format_weight(weight) -> str:
+    if weight is None or weight == "":
+        return ""
+    if isinstance(weight, float) and weight.is_integer():
+        return str(int(weight))
+    return str(weight)
+
+
+def grade_details(grade: Grade) -> list[tuple[str, str]]:
+    fields = [
+        ("Ocena", grade.value),
+        ("Data", grade.date),
+        ("Typ", grade.category),
+        ("Opis", grade.description),
+        ("Waga", grade.weight),
+        ("Nauczyciel", grade.teacher),
+        ("Okres", grade.period),
+    ]
+    return [(label, value) for label, value in fields if value]
+
+
+def grade_one_line(grade: Grade) -> str:
+    """'35/100 - Bieżące: Test progowy po SP (27.09.2026, waga 0)'"""
+    what = ": ".join(x for x in (grade.category, grade.description) if x)
+    extra = ", ".join(x for x in (grade.date, f"waga {grade.weight}" if grade.weight else "") if x)
+    line = grade.value
+    if what:
+        line += f" - {what}"
+    if extra:
+        line += f" ({extra})"
+    return line
+
+
+def format_grades_text(
+    user_name, student, title, new_grades: list[Grade], subject_grades: dict[str, list[Grade]]
+) -> str:
+    lines = [f"*VULCAN {user_name} ({student}) - {title}*", ""]
+    lines.append("Nowa ocena:" if len(new_grades) == 1 else "Nowe oceny:")
+    for grade in new_grades:
+        details = grade_details(grade)
+        lines.append(f"• {details[0][0]}: {details[0][1]}")
+        lines.extend(f"    {label}: {value}" for label, value in details[1:])
+    lines.append("")
+    lines.append(f"Wszystkie oceny z przedmiotu {new_grades[0].subject}:")
+    for period, grades in subject_grades.items():
+        lines.append(f"{period}:")
+        lines.extend(f"• {grade_one_line(g)}" for g in grades)
+    return "\n".join(lines)
+
+
+def format_grades_html(title, new_grades: list[Grade], subject_grades: dict[str, list[Grade]]) -> str:
+    esc = html.escape
+    parts = [f"<h3>{esc(title)}</h3>", f"<p>{'Nowa ocena' if len(new_grades) == 1 else 'Nowe oceny'}:</p><ul>"]
+    for grade in new_grades:
+        details = "<br/>".join(f"{esc(label)}: <b>{esc(value)}</b>" for label, value in grade_details(grade))
+        parts.append(f"<li>{details}</li>")
+    parts.append(f"</ul><p>Wszystkie oceny z przedmiotu {esc(new_grades[0].subject)}:</p>")
+    for period, grades in subject_grades.items():
+        parts.append(f"<p>{esc(period)}:</p><ul>")
+        parts.extend(f"<li>{esc(grade_one_line(g))}</li>" for g in grades)
+        parts.append("</ul>")
+    return "".join(parts)
 
 
 class VulcanNotifier:
@@ -730,10 +881,12 @@ class VulcanNotifier:
             msg += "\n\nZałączniki:\n"
             for attachment_name, link in attachment_links:
                 msg += f"- <{link}|{attachment_name}>\n"
+        self._post_webhook(msg)
 
+    def _post_webhook(self, text: str):
         response = requests.post(
             self._vulcan_user.notify.webhook,
-            data=json.dumps({"text": msg}),
+            data=json.dumps({"text": text}),
             headers={"Content-Type": "application/json"},
             timeout=30,
         )
@@ -747,13 +900,6 @@ class VulcanNotifier:
         return f'"{sender_info_encoded}" <{sender_email}>'
 
     def send_email(self, msg_from_db):
-        msg = MIMEMultipart("alternative")
-        msg.set_charset("utf-8")
-
-        msg["Subject"] = msg_from_db.subject
-        msg["From"] = self.format_sender(msg_from_db.sender, self._vulcan_user.notify.smtp_user)
-        msg["To"] = ", ".join(self._vulcan_user.notify.email_dest)
-
         attachments = self._get_attachments(msg_from_db)
         attachments_only_with_link = [a for a in attachments if a.data is None]
         attachments_with_data = [a for a in attachments if a.data is not None]
@@ -770,9 +916,23 @@ class VulcanNotifier:
             + "</ul>"
         )
 
-        msg.attach(MIMEText(msg_from_db.contents_html + attachments_as_html_msg, "html"))
-        msg.attach(MIMEText(msg_from_db.contents_text + attachments_as_text_msg, "plain"))
-        for attach in attachments_with_data:
+        self._send_email(
+            subject=msg_from_db.subject,
+            sender_name=msg_from_db.sender,
+            contents_html=msg_from_db.contents_html + attachments_as_html_msg,
+            contents_text=msg_from_db.contents_text + attachments_as_text_msg,
+            attachments=attachments_with_data,
+        )
+
+    def _send_email(self, subject, sender_name, contents_html, contents_text, attachments=()):
+        msg = MIMEMultipart("alternative")
+        msg.set_charset("utf-8")
+        msg["Subject"] = subject
+        msg["From"] = self.format_sender(sender_name, self._vulcan_user.notify.smtp_user)
+        msg["To"] = ", ".join(self._vulcan_user.notify.email_dest)
+        msg.attach(MIMEText(contents_html, "html"))
+        msg.attach(MIMEText(contents_text, "plain"))
+        for attach in attachments:
             part = MIMEApplication(attach.data, Name=attach.name)
             part["Content-Disposition"] = f'attachment; filename="{attach.name}"'
             msg.attach(part)
@@ -783,6 +943,35 @@ class VulcanNotifier:
         server.login(self._vulcan_user.notify.smtp_user, self._vulcan_user.notify.smtp_pass)
         server.sendmail(self._vulcan_user.notify.smtp_user, self._vulcan_user.notify.email_dest, msg.as_string())
         server.close()
+
+    # --- grades ----------------------------------------------------------------
+
+    def get_grade(self, key):
+        return self._session.get(Grade, key)
+
+    def add_grade(self, grade: Grade) -> Grade:
+        existing = self.get_grade(grade.key)
+        if existing:
+            return existing
+        self._session.add(grade)
+        return grade
+
+    def notify_grades(
+        self, student: str, subject: str, new_grades: list[Grade], subject_grades: dict[str, list[Grade]]
+    ):
+        """new_grades - grades to announce; subject_grades - all grades of the subject, per period"""
+        values = ", ".join(g.value for g in new_grades)
+        title = f"{'Nowa ocena' if len(new_grades) == 1 else 'Nowe oceny'}: {subject} {values}"
+        logger.info(f"Sending grades notification '{title}' for {student}")
+        if self._vulcan_user.notify.is_webhook():
+            self._post_webhook(format_grades_text(self._vulcan_user.name, student, title, new_grades, subject_grades))
+        else:
+            self._send_email(
+                subject=f"{self._vulcan_user.name}: {title}",
+                sender_name=f"eduVULCAN - {student}",
+                contents_html=format_grades_html(title, new_grades, subject_grades),
+                contents_text=format_grades_text(self._vulcan_user.name, student, title, new_grades, subject_grades),
+            )
 
 
 def read_pyvulcan_config(workdir: str, config_file: str) -> tuple[PyVulcanConfig, list[VulcanUser]]:
@@ -855,35 +1044,165 @@ def fetch_msg(client: VulcanClient, tenant: str, mailbox: dict, item: dict, fetc
     return msg, attachments
 
 
-def handle_user(pyvulcan_config: PyVulcanConfig, vulcan_user: VulcanUser):
+def make_grade(
+    tenant, pupil, period, subject, value, date="", category="", description="", weight="", teacher="", extra=""
+):
+    raw_key = json.dumps([tenant, pupil["key"], period, subject, category, description, value, date, extra])
+    return Grade(
+        key=hashlib.sha1(raw_key.encode(), usedforsecurity=False).hexdigest(),
+        tenant=tenant,
+        student=pupil["uczen"],
+        period=period,
+        subject=subject,
+        value=value,
+        date=date,
+        category=category,
+        description=description,
+        weight=format_weight(weight),
+        teacher=teacher,
+    )
+
+
+def exam_to_grade(tenant, pupil, period, exam: dict) -> Grade:
+    """Exam tabs have been empty so far - the item format is unknown, so map fields defensively."""
+
+    def pick(*names):
+        return next((str(exam[n]).strip() for n in names if exam.get(n) not in (None, "")), "")
+
+    known = {"przedmiot", "przedmiotNazwa", "nazwa", "ocena", "wynik", "wpis", "data", "dataEgzaminu", "opis"}
+    rest = ", ".join(f"{k}: {v}" for k, v in exam.items() if k not in known and v not in (None, "", []))
+    return make_grade(
+        tenant,
+        pupil,
+        period,
+        subject=pick("przedmiot", "przedmiotNazwa", "nazwa") or "Egzamin",
+        value=pick("ocena", "wynik", "wpis") or "?",
+        date=pick("data", "dataEgzaminu"),
+        description=pick("opis") or rest,
+        extra=json.dumps(exam, sort_keys=True, ensure_ascii=False),
+    )
+
+
+def collect_grades(client: VulcanClient, tenant: str, pupil: dict) -> list[Grade]:
+    """All grades from every tab of "Oceny": Okres 1..N, Wyniki egzaminów, Wyniki egzaminów zewnętrznych."""
+    grades = []
+    for period in sorted(client.periods(tenant, pupil), key=lambda p: p["numerOkresu"]):
+        period_name = f"Okres {period['numerOkresu']}"
+        for subj in client.grades(tenant, pupil, period["id"]):
+            subject = subj["przedmiotNazwa"]
+            for column in subj.get("kolumnyOcenyCzastkowe") or []:
+                for g in column.get("oceny") or []:
+                    grades.append(
+                        make_grade(
+                            tenant,
+                            pupil,
+                            period_name,
+                            subject,
+                            value=(g.get("wpis") or "").strip(),
+                            date=g.get("dataOceny") or "",
+                            category=g.get("kategoriaKolumny") or column.get("kategoriaKolumny") or "",
+                            description=g.get("nazwaKolumny") or column.get("nazwaKolumny") or "",
+                            weight=g.get("waga"),
+                            teacher=g.get("nauczyciel") or "",
+                            extra=str(g.get("idKolumny") or column.get("idKolumny")),
+                        )
+                    )
+            for field, category in (
+                ("proponowanaOcenaOkresowa", "Proponowana ocena okresowa"),
+                ("ocenaOkresowa", "Ocena okresowa"),
+            ):
+                value = (subj.get(field) or "").strip()
+                if value:
+                    grades.append(make_grade(tenant, pupil, period_name, subject, value=value, category=category))
+    for period_name, exams in (
+        (EXAMS_PERIOD, client.exams(tenant, pupil)),
+        (EXTERNAL_EXAMS_PERIOD, client.external_exams(tenant, pupil)),
+    ):
+        grades.extend(exam_to_grade(tenant, pupil, period_name, exam) for exam in exams or [])
+    return grades
+
+
+def grade_is_too_old(grade: Grade, max_age: datetime.timedelta) -> bool:
+    try:
+        date = datetime.datetime.strptime(grade.date, "%d.%m.%Y")
+    except ValueError:
+        return False  # undated (e.g. periodic grade) - always new
+    return datetime.datetime.now() - date > max_age + datetime.timedelta(days=1)
+
+
+def handle_grades(client: VulcanClient, notifier: VulcanNotifier, vulcan_user: VulcanUser, max_age: datetime.timedelta):
+    student_filter = vulcan_user.student.lower()
+    for tenant in client.tenants:
+        pupils = [p for p in client.pupils(tenant) if student_filter in p["uczen"].lower()]
+        if not pupils:
+            logger.info(f"No pupil matching student='{vulcan_user.student}' in {tenant}")
+        for pupil in pupils:
+            all_grades = collect_grades(client, tenant, pupil)
+            logger.info(f"{pupil['uczen']}: {len(all_grades)} grades")
+            new_by_subject: dict[str, list[Grade]] = {}
+            for grade in all_grades:
+                db_grade = notifier.get_grade(grade.key)
+                if db_grade is None:
+                    if grade_is_too_old(grade, max_age):
+                        logger.debug(f"Skip grade {grade.subject} {grade.value} (too old, {grade.date})")
+                        continue
+                    grade.first_seen = datetime.datetime.now()
+                    db_grade = notifier.add_grade(grade)
+                if not db_grade.email_sent:
+                    new_by_subject.setdefault(grade.subject, []).append(db_grade)
+            for subject, new_grades in new_by_subject.items():
+                subject_grades: dict[str, list[Grade]] = {}
+                for grade in all_grades:
+                    if grade.subject == subject:
+                        subject_grades.setdefault(grade.period, []).append(grade)
+                notifier.notify_grades(pupil["uczen"], subject, new_grades, subject_grades)
+                for grade in new_grades:
+                    grade.email_sent = True
+                notifier.commit()
+
+
+def handle_messages(
+    client: VulcanClient,
+    notifier: VulcanNotifier,
+    pyvulcan_config: PyVulcanConfig,
+    vulcan_user: VulcanUser,
+    max_age: datetime.timedelta,
+):
     fetch_content = should_fetch_attachment_content(pyvulcan_config, vulcan_user)
+    for tenant in client.tenants:
+        mailboxes = [m for m in client.mailboxes(tenant) if vulcan_user.student.lower() in m["nazwa"].lower()]
+        if not mailboxes:
+            logger.info(f"No mailbox matching student='{vulcan_user.student}' in {tenant}")
+        for mailbox in mailboxes:
+            # API returns newest first - process oldest first, like pylibrus
+            for item in reversed(client.received(tenant, mailbox["globalKey"])):
+                msg = notifier.get_msg(item["apiGlobalKey"])
+                if not msg:
+                    if datetime.datetime.now() - parse_vulcan_date(item["data"]) > max_age:
+                        logger.debug(f"Skip '{item['temat']}' (message too old, {item['data']})")
+                        continue
+                    logger.debug(f"Fetch {item['apiGlobalKey']}")
+                    msg, attachments = fetch_msg(client, tenant, mailbox, item, fetch_content)
+                    msg = notifier.add_msg(msg, attachments)
+
+                if pyvulcan_config.send_message == "unsent" and msg.email_sent:
+                    logger.debug(f"Do not send '{msg.subject}' (message already sent)")
+                elif pyvulcan_config.send_message == "unread" and item.get("przeczytana"):
+                    logger.debug(f"Do not send '{msg.subject}' (message already read)")
+                else:
+                    notifier.notify(msg)
+                    msg.email_sent = True
+                notifier.commit()
+
+
+def handle_user(pyvulcan_config: PyVulcanConfig, vulcan_user: VulcanUser):
     max_age = datetime.timedelta(days=pyvulcan_config.max_age_of_sending_msg_days)
     with VulcanClient(vulcan_user.login, vulcan_user.password, pyvulcan_config) as client:
         with VulcanNotifier(pyvulcan_config, vulcan_user) as notifier:
-            for tenant in client.tenants:
-                mailboxes = [m for m in client.mailboxes(tenant) if vulcan_user.student.lower() in m["nazwa"].lower()]
-                if not mailboxes:
-                    logger.info(f"No mailbox matching student='{vulcan_user.student}' in {tenant}")
-                for mailbox in mailboxes:
-                    # API returns newest first - process oldest first, like pylibrus
-                    for item in reversed(client.received(tenant, mailbox["globalKey"])):
-                        msg = notifier.get_msg(item["apiGlobalKey"])
-                        if not msg:
-                            if datetime.datetime.now() - parse_vulcan_date(item["data"]) > max_age:
-                                logger.debug(f"Skip '{item['temat']}' (message too old, {item['data']})")
-                                continue
-                            logger.debug(f"Fetch {item['apiGlobalKey']}")
-                            msg, attachments = fetch_msg(client, tenant, mailbox, item, fetch_content)
-                            msg = notifier.add_msg(msg, attachments)
-
-                        if pyvulcan_config.send_message == "unsent" and msg.email_sent:
-                            logger.debug(f"Do not send '{msg.subject}' (message already sent)")
-                        elif pyvulcan_config.send_message == "unread" and item.get("przeczytana"):
-                            logger.debug(f"Do not send '{msg.subject}' (message already read)")
-                        else:
-                            notifier.notify(msg)
-                            msg.email_sent = True
-                        notifier.commit()
+            if pyvulcan_config.check_messages:
+                handle_messages(client, notifier, pyvulcan_config, vulcan_user, max_age)
+            if pyvulcan_config.check_grades:
+                handle_grades(client, notifier, vulcan_user, max_age)
 
 
 def parse_args():

@@ -1,7 +1,7 @@
 # pyVulcan
 
-Forwards every new message ("Wiadomości") from the eduVULCAN e-register
-(`eduvulcan.pl`, Vulcan UONET+) to e-mail or a webhook (Slack). A sibling of
+Forwards every new message ("Wiadomości") and every new grade ("Oceny") from the
+eduVULCAN e-register (`eduvulcan.pl`, Vulcan UONET+) to e-mail or a webhook (Slack). A sibling of
 [pylibrus](https://github.com/albrycht/pylibrus), which does the same for Librus.
 
 ## Running
@@ -21,6 +21,17 @@ Messages are stored in local SQLite (`pyvulcan.sqlite`); session cookies in
 Add one `[user:Name]` section per child. When one eduVULCAN login has access to
 several children, use the same `vulcan_user` in every section and set `student=`
 to a substring of the child's mailbox name (e.g. first name).
+
+## Grades
+
+Every run reads all tabs of "Oceny": `Okres 1..3`, `Wyniki egzaminów` and
+`Wyniki egzaminów zewnętrznych` (partial grades plus proposed/final periodic grades).
+New grades are grouped per subject into one notification containing the details of
+the new grade(s) (Ocena, Data, Typ, Opis, Waga, Nauczyciel) and, as a separate list,
+all grades the student already has in that subject. A grade whose value changes is
+reported as a new grade. `max_age_of_sending_msg_days` applies to grades too
+(by grade date); `send_message=unread` is ignored for grades. Disable with
+`check_grades=false` (or messages with `check_messages=false`).
 
 ## Session handling
 
@@ -61,9 +72,20 @@ Reverse-engineered from the web app (version 26.06) — may change without notic
    - `LiczbyNieodczytanych` – unread counters per mailbox
    - expired session → HTTP `409`
 
+5. **Student panel** – entry point is `uri` claim from the student's JWT
+   (`https://uczen.eduvulcan.pl/<tenant>/start?profil=...`), same SSO forms, then
+   `https://uczen.eduvulcan.pl/<tenant>/api/`:
+   - `Context` – `uczniowie[{key, uczen, idDziennik, oddzial, globalKeySkrzynka, ...}]`
+   - `OkresyKlasyfikacyjne?key=&idDziennik=` – `[{id, numerOkresu, dataOd, dataDo}]`
+   - `Oceny?key=&idOkresKlasyfikacyjny=` – `ocenyPrzedmioty[{przedmiotNazwa, kolumnyOcenyCzastkowe[{oceny[{wpis,
+     dataOceny, kategoriaKolumny, nazwaKolumny, waga, nauczyciel, zmienionaOdOstatniegoLogowania}]}], srednia,
+     proponowanaOcenaOkresowa, ocenaOkresowa}]`
+   - `Egzaminy?key=`, `EgzaminyZewnetrzne?key=` – exam result tabs (item format not seen yet)
+   - errors are HTTP 200 with `{"success": false, "feedback": {"Message": ...}}`
+
 Attachment download (`zalaczniki[].url`) is not yet verified against a real message with attachments.
 
 ## Potential improvements
 
-* announcements, grades, homework, timetable
+* announcements, homework, timetable, attendance
 * switch to the mobile "Hebe" API (device certificate, no web session) if web sessions prove fragile
