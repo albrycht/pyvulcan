@@ -22,6 +22,7 @@ from http import client as http_client
 from pathlib import Path
 from textwrap import dedent
 from urllib.parse import quote, urljoin
+from zoneinfo import ZoneInfo
 
 import boto3
 import requests
@@ -688,9 +689,14 @@ class VulcanClient:
         return self._api_get(self.STUDENT_URL, tenant, "EgzaminyZewnetrzne", key=pupil["key"])
 
 
+def now_local() -> datetime.datetime:
+    """Current Europe/Warsaw wall-clock time (naive) - Vulcan dates are Warsaw time, servers often run in UTC"""
+    return datetime.datetime.now(ZoneInfo("Europe/Warsaw")).replace(tzinfo=None)
+
+
 def parse_vulcan_date(s: str) -> datetime.datetime:
     """'2026-09-17T12:50:20.877+02:00' -> naive local (Europe/Warsaw) datetime"""
-    return datetime.datetime.fromisoformat(s).replace(tzinfo=None)
+    return datetime.datetime.fromisoformat(s).astimezone(ZoneInfo("Europe/Warsaw")).replace(tzinfo=None)
 
 
 def html_to_text(contents_html: str) -> str:
@@ -1127,7 +1133,7 @@ def grade_is_too_old(grade: Grade, max_age: datetime.timedelta) -> bool:
         date = datetime.datetime.strptime(grade.date, "%d.%m.%Y")
     except ValueError:
         return False  # undated (e.g. periodic grade) - always new
-    return datetime.datetime.now() - date > max_age + datetime.timedelta(days=1)
+    return now_local() - date > max_age + datetime.timedelta(days=1)
 
 
 def handle_grades(client: VulcanClient, notifier: VulcanNotifier, vulcan_user: VulcanUser, max_age: datetime.timedelta):
@@ -1146,7 +1152,7 @@ def handle_grades(client: VulcanClient, notifier: VulcanNotifier, vulcan_user: V
                     if grade_is_too_old(grade, max_age):
                         logger.debug(f"Skip grade {grade.subject} {grade.value} (too old, {grade.date})")
                         continue
-                    grade.first_seen = datetime.datetime.now()
+                    grade.first_seen = now_local()
                     db_grade = notifier.add_grade(grade)
                 if not db_grade.email_sent:
                     new_by_subject.setdefault(grade.subject, []).append(db_grade)
@@ -1178,7 +1184,7 @@ def handle_messages(
             for item in reversed(client.received(tenant, mailbox["globalKey"])):
                 msg = notifier.get_msg(item["apiGlobalKey"])
                 if not msg:
-                    if datetime.datetime.now() - parse_vulcan_date(item["data"]) > max_age:
+                    if now_local() - parse_vulcan_date(item["data"]) > max_age:
                         logger.debug(f"Skip '{item['temat']}' (message too old, {item['data']})")
                         continue
                     logger.debug(f"Fetch {item['apiGlobalKey']}")
