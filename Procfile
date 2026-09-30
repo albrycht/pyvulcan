@@ -1,1 +1,1 @@
-cron: */5 * * * * uv run src/pyvulcan/pyvulcan.py
+cron: */5 * * * * uv run --no-dev src/pyvulcan/pyvulcan.py
